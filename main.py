@@ -3,6 +3,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
@@ -36,6 +37,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineSettings
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 import lol
@@ -56,10 +58,111 @@ ICON_BASE_URL = (
     "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/"
     "global/default/"
 )
+MASTERY_GRADE_ORDER = ("S+", "S", "S-", "A", "B", "C", "D", "E", "F")
+
+
+def app_icon_cache_dir():
+    if sys.platform == "darwin":
+        cache_root = Path.home() / "Library" / "Caches"
+    else:
+        cache_root = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".cache"))
+    return cache_root / "Riftboard" / "champion-icons"
+
+
+def reset_marker_path():
+    return lol.STORAGE_ROOT.parent / f".{lol.STORAGE_ROOT.name}-reset-pending"
+
+
+def schedule_full_reset(preferences):
+    updated_preferences = dict(preferences)
+    updated_preferences["first_run"] = True
+    updated_preferences["auto_start_on_lockfile"] = False
+    lol.save_preferences(updated_preferences)
+
+    marker = reset_marker_path()
+    try:
+        marker.write_text("reset requested\n", encoding="utf-8")
+    except OSError as marker_error:
+        try:
+            lol.save_preferences(preferences)
+        except OSError as rollback_error:
+            raise OSError(
+                f"Could not schedule reset ({marker_error}); could not restore settings ({rollback_error})"
+            ) from marker_error
+        raise
+    return updated_preferences
+
+
+def complete_pending_reset():
+    marker = reset_marker_path()
+    if not marker.exists():
+        return False
+
+    for target in (lol.STORAGE_ROOT, app_icon_cache_dir()):
+        if target.is_symlink() or target.is_file():
+            target.unlink()
+        elif target.is_dir():
+            shutil.rmtree(target)
+    marker.unlink()
+    return True
+
+
+def create_loldle_profile(parent):
+    profile_root = lol.STORAGE_ROOT / "loldle-browser"
+    cache_path = profile_root / "cache"
+    storage_path = profile_root / "storage"
+    cache_path.mkdir(parents=True, exist_ok=True)
+    storage_path.mkdir(parents=True, exist_ok=True)
+
+    profile = QWebEngineProfile("Riftboard-LoLdle", parent)
+    profile.setCachePath(str(cache_path))
+    profile.setPersistentStoragePath(str(storage_path))
+    profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+    profile.setPersistentCookiesPolicy(
+        QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies
+    )
+    return profile
 
 
 def normalize_name(name):
     return "".join(character.casefold() for character in name if character.isalnum())
+
+
+def champion_icon_urls(summary):
+    if not isinstance(summary, list):
+        return {}
+    by_name = {}
+    for item in summary:
+        if not isinstance(item, dict):
+            continue
+        alias = str(item.get("alias") or "")
+        if alias.startswith("Jade_"):
+            continue
+        try:
+            champion_id = int(item.get("id", 0))
+        except (TypeError, ValueError):
+            continue
+        if not 0 < champion_id < 60000:
+            continue
+        name = item.get("name")
+        portrait = item.get("squarePortraitPath")
+        if name and portrait:
+            portrait = portrait.replace("/lol-game-data/assets/", "/")
+            by_name.setdefault(
+                normalize_name(name),
+                urljoin(ICON_BASE_URL, portrait.lstrip("/")),
+            )
+    return by_name
+
+
+def mastery_grade_sort_key(grade, best_first=True):
+    normalized_grade = str(grade or "").strip().upper()
+    grade_rank = {
+        value: index for index, value in enumerate(MASTERY_GRADE_ORDER)
+    }.get(normalized_grade)
+    if grade_rank is None:
+        return True, 0
+    return False, grade_rank if best_first else -grade_rank
 
 
 def read_report(path):
@@ -139,17 +242,85 @@ def parse_match_history(lines):
     pattern = re.compile(
         r"^(.+?)\s+\|\s+Match\s+(.+?)\s+\|\s+(.+?)\s+\|\s+"
         r"(SIEG|NIEDERLAGE|UNBEKANNT)\s+\|\s+(.+?)\s+\|\s+"
-        r"(?:Dauer\s+(\d+:\d+)\s+\|\s+)?KDA\s+(\d+|–)/(\d+|–)/(\d+|–)$"
+        r"(?:Dauer\s+(\d+:\d+)\s+\|\s+)?KDA\s+(\d+|–)/(\d+|–)/(\d+|–)"
+        r"(?:\s+\|\s+Lane\s+(.+))?$"
     )
     matches = []
     for line in lines[start + 1 :]:
         match = pattern.match(line)
         if match:
-            date, match_id, mode, result, champion, duration, kills, deaths, assists = match.groups()
+            (
+                date,
+                match_id,
+                mode,
+                result,
+                champion,
+                duration,
+                kills,
+                deaths,
+                assists,
+                lane,
+            ) = match.groups()
+            lane = (
+                "–"
+                if not lane
+                or lane.strip().casefold() in {"–", "nicht verfügbar", "not available"}
+                else lane.strip()
+            )
             matches.append(
-                (date, match_id, mode, result, champion, duration or "–", kills, deaths, assists)
+                (
+                    date,
+                    match_id,
+                    mode,
+                    result,
+                    champion,
+                    duration or "–",
+                    kills,
+                    deaths,
+                    assists,
+                    lane,
+                )
             )
     return matches
+
+
+def parse_lane_bias(lines):
+    line = next((line for line in lines if line.startswith("LANE_BIAS:")), None)
+    if line is None:
+        return {}
+    counts = {}
+    for entry in line.partition(":")[2].split(";"):
+        lane, separator, raw_count = entry.partition("=")
+        if not separator or lane not in ("Top", "Jungle", "Mid", "Bot", "Support"):
+            continue
+        try:
+            count = int(raw_count)
+        except ValueError:
+            continue
+        if count > 0:
+            counts[lane] = count
+    return counts
+
+
+def parse_lane_mastery_bias(mastery_lanes):
+    totals = {}
+    for lane in ("Top", "Jungle", "Mid", "Bot", "Support"):
+        seen_champions = set()
+        total_points = 0
+        for champion, score, *_details in mastery_lanes.get(lane, []):
+            key = normalize_name(champion)
+            if key in seen_champions:
+                continue
+            seen_champions.add(key)
+            try:
+                points = int(score)
+            except (TypeError, ValueError):
+                continue
+            if points > 0:
+                total_points += points
+        if total_points > 0:
+            totals[lane] = total_points
+    return totals
 
 
 def parse_tft_history(lines):
@@ -223,11 +394,7 @@ class Dashboard(QMainWindow):
         self._retry_delay_seconds = 3
         self.data_ready = False
 
-        if sys.platform == "darwin":
-            cache_root = Path.home() / "Library" / "Caches"
-        else:
-            cache_root = Path(os.environ.get("LOCALAPPDATA", Path.home() / ".cache"))
-        self.icon_cache_dir = cache_root / "Riftboard" / "champion-icons"
+        self.icon_cache_dir = app_icon_cache_dir()
         self.mastery_sort_descending = True
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setInterval(self.refresh_interval_seconds * 1000)
@@ -287,6 +454,8 @@ class Dashboard(QMainWindow):
                 "title": "RIFTBOARD",
                 "subtitle": "Your League profile at a glance",
                 "refresh": "Refresh",
+                "refresh_display": "Refresh display",
+                "refresh_display_tooltip": "Reload saved reports and redraw the current display without fetching League data.",
                 "status_loading": "Loading reports…",
                 "status_update": "Updating League data…",
                 "update_failed": "Refresh failed",
@@ -300,6 +469,13 @@ class Dashboard(QMainWindow):
                 "kda": "AVG KDA",
                 "be": "BLUE ESSENCE REQUIRED",
                 "honor": "HONOR",
+                "lane_bias": "MOST QUEUED LANE",
+                "lane_bias_unavailable": "Not enough lane data",
+                "lane_bias_value": "{lanes} · {count} matches",
+                "lane_mastery_bias": "MASTERY LANE BIAS",
+                "lane_mastery_bias_unavailable": "Not enough mastery lane data",
+                "lane_mastery_bias_value": "{lanes} · {points} mastery points",
+                "lane_not_available": "Not available",
                 "top5": "TOP 5 BY GAMES",
                 "missing": "MISSING CHAMPIONS",
                 "settings": "Settings",
@@ -368,6 +544,11 @@ class Dashboard(QMainWindow):
                 "mastery_by_lane_label": "MASTERY BY LANE",
                 "settings_tab": "Settings",
                 "general": "General",
+                "reset_all_data": "Reset all local data…",
+                "reset_all_title": "Reset all Riftboard data?",
+                "reset_all_confirm": "This permanently deletes Riftboard preferences, reports, champion and lane caches, and LoLdle cookies and site storage. The app will close now; the data will be erased before the next launch, which will show first-start settings. This cannot be undone.",
+                "reset_all_confirm_button": "Reset everything",
+                "reset_all_failed": "Could not schedule the full reset",
                 "champion_data": "Champion data",
                 "client_connection": "League Client connection",
                 "language": "Language",
@@ -421,7 +602,8 @@ class Dashboard(QMainWindow):
                 "save_failed": "Save failed",
                 "save_failed_detail": "Your pending changes are still available. Please retry.",
                 "reset_title": "Reset lane assignments",
-                "reset_confirm": "Stage the standard lane assignments? They will not be saved until Apply.",
+                "reset_confirm": "Refresh the champion catalog from CommunityDragon/Data Dragon and stage the standard lane checkboxes? The reset will not be saved until Apply.",
+                "reset_refresh_failed": "Champion reference data could not be refreshed. No lane assignments were changed.",
                 "catalog_loading": "Loading champion reference data…",
                 "catalog_unavailable": "Champion reference data is unavailable. Check your connection and reopen the assigner.",
                 "auto_start_tooltip": "A small background watcher remains active after the companion closes. It does not enable Windows login startup and must be started again after a Windows restart.",
@@ -432,6 +614,8 @@ class Dashboard(QMainWindow):
                 "title": "RIFTBOARD",
                 "subtitle": "Dein League-Profil auf einen Blick",
                 "refresh": "Aktualisieren",
+                "refresh_display": "Anzeige aktualisieren",
+                "refresh_display_tooltip": "Gespeicherte Berichte neu laden und die Anzeige aktualisieren, ohne League-Daten abzurufen.",
                 "status_loading": "Berichte werden geladen …",
                 "status_update": "League-Daten werden aktualisiert …",
                 "update_failed": "Aktualisierung fehlgeschlagen",
@@ -445,6 +629,13 @@ class Dashboard(QMainWindow):
                 "kda": "Ø KDA",
                 "be": "BLUE ESSENCE ERFORDERLICH",
                 "honor": "EHRE",
+                "lane_bias": "MEISTGESPIELTE LANE",
+                "lane_bias_unavailable": "Keine Lane-Daten verfügbar",
+                "lane_bias_value": "{lanes} · {count} Spiele",
+                "lane_mastery_bias": "MEISTERSCHAFTS-LANE-FOKUS",
+                "lane_mastery_bias_unavailable": "Keine Lane-Meisterschaftsdaten",
+                "lane_mastery_bias_value": "{lanes} · {points} Meisterschaftspunkte",
+                "lane_not_available": "Nicht verfügbar",
                 "top5": "TOP 5 NACH SPIELEN",
                 "missing": "FEHLENDE CHAMPIONS",
                 "settings": "Einstellungen",
@@ -513,6 +704,11 @@ class Dashboard(QMainWindow):
                 "mastery_by_lane_label": "MASTERY NACH LANE",
                 "settings_tab": "Einstellungen",
                 "general": "Allgemein",
+                "reset_all_data": "Alle lokalen Daten zurücksetzen…",
+                "reset_all_title": "Alle Riftboard-Daten zurücksetzen?",
+                "reset_all_confirm": "Dadurch werden Riftboard-Einstellungen, Berichte, Champion- und Lane-Caches sowie LoLdle-Cookies und Website-Speicher dauerhaft gelöscht. Die Anwendung wird jetzt geschlossen; die Daten werden vor dem nächsten Start gelöscht und die Ersteinrichtung wird angezeigt. Dieser Vorgang kann nicht rückgängig gemacht werden.",
+                "reset_all_confirm_button": "Alles zurücksetzen",
+                "reset_all_failed": "Vollständiges Zurücksetzen konnte nicht vorgemerkt werden",
                 "champion_data": "Champion-Daten",
                 "client_connection": "League-Client-Verbindung",
                 "language": "Sprache",
@@ -566,7 +762,8 @@ class Dashboard(QMainWindow):
                 "save_failed": "Speichern fehlgeschlagen",
                 "save_failed_detail": "Die Änderungen sind weiterhin vorhanden. Bitte erneut versuchen.",
                 "reset_title": "Lane-Zuweisungen zurücksetzen",
-                "reset_confirm": "Standard-Lanes vorläufig laden? Gespeichert wird erst mit „Übernehmen“.",
+                "reset_confirm": "Champion-Katalog aus CommunityDragon/Data Dragon neu laden und Standard-Lanes vorläufig setzen? Gespeichert wird erst mit „Übernehmen“.",
+                "reset_refresh_failed": "Champion-Referenzdaten konnten nicht aktualisiert werden. Lane-Zuweisungen wurden nicht geändert.",
                 "catalog_loading": "Champion-Referenzdaten werden geladen…",
                 "catalog_unavailable": "Champion-Referenzdaten sind nicht verfügbar. Verbindung prüfen und die Zuweisung erneut öffnen.",
                 "auto_start_tooltip": "Ein kleiner Hintergrund-Wächter bleibt nach dem Schließen aktiv. Der Windows-Autostart wird nicht aktiviert; nach einem Windows-Neustart muss die Anwendung erneut gestartet werden.",
@@ -695,6 +892,9 @@ class Dashboard(QMainWindow):
             self.status_label.setText(self._t(self._refresh_status_key))
         if hasattr(self, "refresh_button"):
             self.refresh_button.setText(text["refresh"])
+        if hasattr(self, "refresh_display_button"):
+            self.refresh_display_button.setText(self._t("refresh_display"))
+            self.refresh_display_button.setToolTip(self._t("refresh_display_tooltip"))
         if hasattr(self, "settings_button"):
             self.settings_button.setText(text["settings"])
         if hasattr(self, "tabs"):
@@ -787,6 +987,10 @@ class Dashboard(QMainWindow):
         self.refresh_button.setObjectName("accentButton")
         self.refresh_button.clicked.connect(self.refresh_reports)
         header.addWidget(self.refresh_button)
+        self.refresh_display_button = QPushButton(self._t("refresh_display"))
+        self.refresh_display_button.setToolTip(self._t("refresh_display_tooltip"))
+        self.refresh_display_button.clicked.connect(self.refresh_display)
+        header.addWidget(self.refresh_display_button)
         self.settings_button = QPushButton("Settings")
         self.settings_button.clicked.connect(lambda: self.open_settings(False))
         header.addWidget(self.settings_button)
@@ -866,6 +1070,8 @@ class Dashboard(QMainWindow):
             QPushButton:hover {{ background: #30394a; }}
             QPushButton#accentButton {{ background: {ACCENT}; color: #151922; font-weight: 700; padding: 9px 16px; }}
             QPushButton#accentButton:hover {{ background: #dbc184; }}
+            QPushButton#dangerButton {{ background: #6b303a; color: {TEXT}; }}
+            QPushButton#dangerButton:hover {{ background: #8b3b49; }}
             """
         )
 
@@ -898,6 +1104,14 @@ class Dashboard(QMainWindow):
         self.level_label.setObjectName("muted")
         details.addWidget(self.account_label)
         details.addWidget(self.level_label)
+        self.lane_bias_label = QLabel(self._t("lane_bias_unavailable"))
+        self.lane_bias_label.setObjectName("muted")
+        details.addWidget(self.lane_bias_label)
+        self.lane_mastery_bias_label = QLabel(
+            self._t("lane_mastery_bias_unavailable")
+        )
+        self.lane_mastery_bias_label.setObjectName("muted")
+        details.addWidget(self.lane_mastery_bias_label)
         details.addStretch(1)
         profile_row.addLayout(details, 1)
         profile_layout.addLayout(profile_row, 1)
@@ -1005,6 +1219,10 @@ class Dashboard(QMainWindow):
                     stats=getattr(self, "league_stat_match_count", 0),
                 )
             )
+        if hasattr(self, "lane_bias_label"):
+            self._update_lane_bias_label()
+        if hasattr(self, "lane_mastery_bias_label"):
+            self._update_lane_mastery_bias_label()
         if hasattr(self, "collection_tree"):
             self.collection_tree.setHeaderLabels(
                 ("", self._t("champion"), self._t("ownership"))
@@ -1022,6 +1240,7 @@ class Dashboard(QMainWindow):
                     self._t("mode"),
                     self._t("result"),
                     self._t("champion"),
+                    self._t("lane"),
                     self._t("duration"),
                     self._t("kda"),
                 )
@@ -1050,6 +1269,44 @@ class Dashboard(QMainWindow):
                 self.status_label.setText(f"Queue {queue_id} started")
         except Exception as exc:
             QMessageBox.warning(self, "Queue launch failed", str(exc))
+
+    def _update_lane_bias_label(self):
+        if not hasattr(self, "lane_bias_label"):
+            return
+        counts = getattr(self, "lane_bias_counts", {})
+        highest = max(counts.values(), default=0)
+        if highest <= 0:
+            self.lane_bias_label.setText(self._t("lane_bias_unavailable"))
+            return
+        lanes = " / ".join(
+            self._t(lane.casefold())
+            for lane in lol.LANES
+            if counts.get(lane) == highest
+        )
+        self.lane_bias_label.setText(
+            f"{self._t('lane_bias')}: "
+            f"{self._t('lane_bias_value').format(lanes=lanes, count=highest)}"
+        )
+
+    def _update_lane_mastery_bias_label(self):
+        if not hasattr(self, "lane_mastery_bias_label"):
+            return
+        counts = getattr(self, "lane_mastery_bias_counts", {})
+        highest = max(counts.values(), default=0)
+        if highest <= 0:
+            self.lane_mastery_bias_label.setText(
+                self._t("lane_mastery_bias_unavailable")
+            )
+            return
+        lanes = " / ".join(
+            self._t(lane.casefold())
+            for lane in lol.LANES
+            if counts.get(lane) == highest
+        )
+        self.lane_mastery_bias_label.setText(
+            f"{self._t('lane_mastery_bias')}: "
+            f"{self._t('lane_mastery_bias_value').format(lanes=lanes, points=f'{highest:,}')}"
+        )
 
     def _build_mastery(self):
         layout = QVBoxLayout(self.mastery_tab)
@@ -1113,8 +1370,8 @@ class Dashboard(QMainWindow):
         panel, panel_layout = self._panel("MATCH HISTORY")
         self.match_tree = self._tree(
             panel_layout,
-            ("", "Date", "Match ID", "Mode", "Result", "Champion", "Duration", "K / D / A"),
-            (42, 145, 135, 150, 110, 190, 95, 130),
+            ("", "Date", "Match ID", "Mode", "Result", "Champion", "Lane", "Duration", "K / D / A"),
+            (42, 145, 135, 150, 110, 190, 90, 95, 130),
         )
         self.match_tree.setIconSize(self._icon_size(28))
         layout.addWidget(panel, 1)
@@ -1165,6 +1422,12 @@ class Dashboard(QMainWindow):
         toolbar.addWidget(self.loldle_open_button)
         layout.addLayout(toolbar)
         self.loldle_view = QWebEngineView()
+        self.loldle_profile = create_loldle_profile(self)
+        self.loldle_page = QWebEnginePage(self.loldle_profile, self.loldle_view)
+        self.loldle_page.settings().setAttribute(
+            QWebEngineSettings.WebAttribute.LocalStorageEnabled, True
+        )
+        self.loldle_view.setPage(self.loldle_page)
         self.loldle_view.setUrl(QUrl(LOLDLE_URL))
         layout.addWidget(self.loldle_view, 1)
 
@@ -1186,6 +1449,12 @@ class Dashboard(QMainWindow):
         self.auto_start_checkbox = QCheckBox()
         self.auto_start_checkbox.toggled.connect(self._auto_start_changed)
         general_layout.addWidget(self.auto_start_checkbox)
+        self.reset_all_data_button = QPushButton()
+        self.reset_all_data_button.setObjectName("dangerButton")
+        self.reset_all_data_button.clicked.connect(self._reset_all_data)
+        general_layout.addWidget(
+            self.reset_all_data_button, 0, Qt.AlignmentFlag.AlignLeft
+        )
         layout.addWidget(general)
         self.general_group = general
 
@@ -1250,6 +1519,7 @@ class Dashboard(QMainWindow):
         self.auto_start_checkbox.setToolTip(
             self._t("auto_start_tooltip")
         )
+        self.reset_all_data_button.setText(self._t("reset_all_data"))
         self.champion_data_description.setText(self._t("source_data_info"))
         self.open_assigner_button.setText(self._t("open_assigner"))
         self.lockfile_path_edit.setPlaceholderText(self._t("lockfile_path"))
@@ -1322,6 +1592,35 @@ class Dashboard(QMainWindow):
                     self, self._t("connection_save_failed"), str(error)
                 )
             self._set_connection_status("watcher_start_failed")
+
+    def _reset_all_data(self):
+        confirmation = QMessageBox(self)
+        confirmation.setIcon(QMessageBox.Icon.Warning)
+        confirmation.setWindowTitle(self._t("reset_all_title"))
+        confirmation.setText(self._t("reset_all_confirm"))
+        confirmation.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        confirmation.setDefaultButton(QMessageBox.StandardButton.No)
+        confirmation.button(QMessageBox.StandardButton.Yes).setText(
+            self._t("reset_all_confirm_button")
+        )
+        confirmation.button(QMessageBox.StandardButton.No).setText(self._t("no"))
+        if confirmation.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            self.preferences = schedule_full_reset(self.preferences)
+        except OSError as error:
+            QMessageBox.critical(
+                self,
+                self._t("reset_all_failed"),
+                f"{self._t('reset_all_failed')}: {error}",
+            )
+            return
+
+        self.close()
+        QApplication.quit()
 
     def _browse_lockfile(self):
         selected, _ = QFileDialog.getOpenFileName(
@@ -1546,6 +1845,8 @@ class Dashboard(QMainWindow):
                     (champion, score, ownership, level, grade)
                 )
         self.mastery_lanes = updated
+        self.lane_mastery_bias_counts = parse_lane_mastery_bias(updated)
+        self._update_lane_mastery_bias_label()
         self._populate_mastery()
         self._populate_top_champions()
         self.refresh_reports()
@@ -1617,8 +1918,11 @@ class Dashboard(QMainWindow):
         from PySide6.QtCore import QSize
         return QSize(size, size)
 
-    def load_reports(self):
-        if not getattr(self, "data_ready", False):
+    def refresh_display(self):
+        self.load_reports(force=True)
+
+    def load_reports(self, *, force=False):
+        if not force and not getattr(self, "data_ready", False):
             return
         account = read_report(lol.REPORT_PATH)
         tft_lines = read_report(lol.TFT_REPORT_PATH)
@@ -1675,6 +1979,10 @@ class Dashboard(QMainWindow):
             self.missing_champion_rows.append(match.groups() if match else (entry, ""))
         self.mastery_lanes = parse_mastery_lanes(mastery_lines)
         self.match_rows = parse_match_history(account)
+        self.lane_bias_counts = parse_lane_bias(account)
+        self.lane_mastery_bias_counts = parse_lane_mastery_bias(self.mastery_lanes)
+        self._update_lane_bias_label()
+        self._update_lane_mastery_bias_label()
         stats_count_line = find_line(
             account, "Matches mit vollständigen K/D/A-Werten:"
         )
@@ -1793,9 +2101,7 @@ class Dashboard(QMainWindow):
         query = text.strip().casefold()
         for row in range(self.collection_tree.topLevelItemCount()):
             item = self.collection_tree.topLevelItem(row)
-            self.collection_tree.setRowHidden(
-                row, self.collection_tree.invisibleRootItem(), bool(query and query not in item.text(1).casefold())
-            )
+            item.setHidden(bool(query and query not in item.text(1).casefold()))
 
     def _populate_missing_champions(self):
         if not hasattr(self, "missing_tree"):
@@ -1841,7 +2147,7 @@ class Dashboard(QMainWindow):
         for entry in champions_by_name.values():
             if search_text and search_text not in entry["name"].casefold():
                 continue
-            lanes = ", ".join(self._t(lane.casefold()) for lane in entry["lanes"])
+            lanes = " / ".join(self._t(lane.casefold()) for lane in entry["lanes"])
             rows.append(
                 (
                     entry["name"],
@@ -1856,7 +2162,12 @@ class Dashboard(QMainWindow):
         sort_column = self.sort_column.currentData() if hasattr(self, "sort_column") else "mastery_score"
         descending = self.mastery_sort_descending
         if sort_column == "top_value":
-            rows.sort(key=lambda row: (row[5].casefold(), row[0].casefold()), reverse=descending)
+            rows.sort(
+                key=lambda row: (
+                    *mastery_grade_sort_key(row[5], best_first=descending),
+                    row[0].casefold(),
+                )
+            )
         elif sort_column == "mastery_rank":
             rows.sort(
                 key=lambda row: (int(row[4]) if str(row[4]).isdigit() else -1, row[0].casefold()),
@@ -1889,7 +2200,7 @@ class Dashboard(QMainWindow):
         if not hasattr(self, "match_tree"):
             return
         self.match_tree.clear()
-        for date, match_id, mode, result, champion, duration, kills, deaths, assists in getattr(self, "match_rows", []):
+        for date, match_id, mode, result, champion, duration, kills, deaths, assists, lane in getattr(self, "match_rows", []):
             row = QTreeWidgetItem(
                 (
                     "",
@@ -1898,6 +2209,7 @@ class Dashboard(QMainWindow):
                     mode,
                     self._translate_match_result(result),
                     champion,
+                    self._t("lane_not_available") if lane == "–" else lane,
                     duration,
                     f"{kills}/{deaths}/{assists}",
                 )
@@ -2019,19 +2331,7 @@ class Dashboard(QMainWindow):
                 summary = response.json()
             except (requests.RequestException, ValueError):
                 return
-            by_name = {}
-            for item in summary:
-                try:
-                    champion_id = int(item.get("id", 0))
-                except (TypeError, ValueError):
-                    continue
-                if not 0 < champion_id < 60000:
-                    continue
-                name = item.get("name")
-                portrait = item.get("squarePortraitPath")
-                if name and portrait:
-                    portrait = portrait.replace("/lol-game-data/assets/", "/")
-                    by_name[normalize_name(name)] = urljoin(ICON_BASE_URL, portrait.lstrip("/"))
+            by_name = champion_icon_urls(summary)
             try:
                 self.icon_cache_dir.mkdir(parents=True, exist_ok=True)
             except OSError:
@@ -2233,6 +2533,18 @@ def main():
             if activate_existing_instance():
                 return 0
             return 1
+
+    try:
+        complete_pending_reset()
+    except OSError as error:
+        QMessageBox.critical(
+            None,
+            "Riftboard reset failed",
+            f"Local application data could not be fully cleared: {error}",
+        )
+        server.close()
+        QLocalServer.removeServer(INSTANCE_SERVER_NAME)
+        return 1
 
     dashboard = Dashboard()
 

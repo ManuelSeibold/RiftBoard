@@ -32,6 +32,7 @@ CHAMPION_SUMMARY_URL = (
     "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/"
     "global/default/v1/champion-summary.json"
 )
+SUMMONERS_RIFT_QUEUE_IDS = {400, 420, 430, 440, 470, 480, 490, 700}
 
 LANE_CHAMPIONS = {
     "Top": [
@@ -336,9 +337,14 @@ def _valid_champion_records(payload):
     if not isinstance(payload, (dict, list)):
         return []
     records = []
+    seen_ids = set()
+    seen_names = set()
     values = payload.values() if isinstance(payload, dict) else payload
     for item in values:
         if not isinstance(item, dict):
+            continue
+        alias = str(item.get("alias") or "").strip()
+        if alias.startswith("Jade_"):
             continue
         try:
             champion_id_value = int(item.get("id"))
@@ -350,10 +356,17 @@ def _valid_champion_records(payload):
         name = item.get("name") or item.get("displayName") or item.get("alias")
         if champion_id_value <= 0 or not isinstance(name, str) or not name.strip():
             continue
+        normalized_name = "".join(
+            character.casefold() for character in name if character.isalnum()
+        )
+        if champion_id_value in seen_ids or normalized_name in seen_names:
+            continue
+        seen_ids.add(champion_id_value)
+        seen_names.add(normalized_name)
         record = {
             "id": champion_id_value,
             "name": name.strip(),
-            "alias": str(item.get("alias") or item.get("id") or name).strip(),
+            "alias": alias or str(item.get("id") or name).strip(),
             "squarePortraitPath": item.get("squarePortraitPath"),
         }
         records.append(record)
@@ -374,53 +387,76 @@ def get_champion_catalog(*, fetch_remote=True, force_refresh=False):
     cached = _read_champion_catalog_cache()
     if cached and not fetch_remote:
         return cached
-    if cached and fetch_remote:
+    if cached and fetch_remote and not force_refresh:
         try:
             cache_age = time.time() - CHAMPION_CATALOG_CACHE_PATH.stat().st_mtime
         except OSError:
             cache_age = float("inf")
-        freshness = 300 if force_refresh else 3600
-        if cache_age < freshness:
+        if cache_age < 3600:
             return cached
 
-    records = []
     try:
-        response = requests.get(CHAMPION_SUMMARY_URL, timeout=8)
-        response.raise_for_status()
-        records = _valid_champion_records(response.json())
-    except (requests.RequestException, ValueError):
-        pass
-    if not records:
-        try:
-            versions_response = requests.get(
-                "https://ddragon.leagueoflegends.com/api/versions.json", timeout=8
-            )
-            versions_response.raise_for_status()
-            versions = versions_response.json()
-            if not isinstance(versions, list) or not versions:
-                raise ValueError("Data Dragon did not return a version list.")
-            response = requests.get(
-                f"https://ddragon.leagueoflegends.com/cdn/{versions[0]}/data/en_US/champion.json",
-                timeout=8,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            records = _valid_champion_records(payload.get("data") if isinstance(payload, dict) else None)
-        except (requests.RequestException, ValueError):
-            pass
+        return refresh_champion_catalog()
+    except (requests.RequestException, ValueError, RuntimeError):
+        return cached
 
-    if records:
-        records.sort(key=lambda item: item["name"].casefold())
+
+def _fetch_champion_catalog_from_communitydragon():
+    response = requests.get(CHAMPION_SUMMARY_URL, timeout=8)
+    response.raise_for_status()
+    return _valid_champion_records(response.json())
+
+
+def _fetch_champion_catalog_from_datadragon():
+    versions_response = requests.get(
+        "https://ddragon.leagueoflegends.com/api/versions.json", timeout=8
+    )
+    versions_response.raise_for_status()
+    versions = versions_response.json()
+    if not isinstance(versions, list) or not versions:
+        raise ValueError("Data Dragon did not return a version list.")
+    response = requests.get(
+        f"https://ddragon.leagueoflegends.com/cdn/{versions[0]}/data/en_US/champion.json",
+        timeout=8,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    return _valid_champion_records(
+        payload.get("data") if isinstance(payload, dict) else None
+    )
+
+
+def refresh_champion_catalog(*, prefer_data_dragon=False):
+    """Fetch and cache champion reference records, preferring the requested source."""
+    sources = (
+        (_fetch_champion_catalog_from_datadragon, _fetch_champion_catalog_from_communitydragon)
+        if prefer_data_dragon
+        else (_fetch_champion_catalog_from_communitydragon, _fetch_champion_catalog_from_datadragon)
+    )
+    records = []
+    last_error = None
+    for fetch_source in sources:
         try:
-            CHAMPION_CATALOG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            temporary_path = CHAMPION_CATALOG_CACHE_PATH.with_suffix(".json.tmp")
-            with temporary_path.open("w", encoding="utf-8") as handle:
-                json.dump({"champions": records}, handle, ensure_ascii=False)
-            temporary_path.replace(CHAMPION_CATALOG_CACHE_PATH)
-        except OSError:
-            pass
-        return records
-    return cached
+            records = fetch_source()
+        except (requests.RequestException, ValueError) as error:
+            last_error = error
+            continue
+        if records:
+            break
+    if not records:
+        raise RuntimeError(
+            "Champion data could not be fetched from Data Dragon or CommunityDragon."
+        ) from last_error
+    records.sort(key=lambda item: item["name"].casefold())
+    try:
+        CHAMPION_CATALOG_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = CHAMPION_CATALOG_CACHE_PATH.with_suffix(".json.tmp")
+        with temporary_path.open("w", encoding="utf-8") as handle:
+            json.dump({"champions": records}, handle, ensure_ascii=False)
+        temporary_path.replace(CHAMPION_CATALOG_CACHE_PATH)
+    except OSError:
+        pass
+    return records
 
 
 def champion_id(value):
@@ -440,6 +476,69 @@ def nonnegative_int(value):
     except (TypeError, ValueError, OverflowError):
         return None
     return result if result >= 0 else None
+
+
+def normalize_match_lane(participant):
+    if not isinstance(participant, dict):
+        return None
+    timeline = participant.get("timeline")
+    timeline = timeline if isinstance(timeline, dict) else {}
+    aliases = {
+        "TOP": "Top",
+        "JUNGLE": "Jungle",
+        "MIDDLE": "Mid",
+        "MID": "Mid",
+        "CENTER": "Mid",
+        "BOTTOM": "Bot",
+        "BOT": "Bot",
+        "UTILITY": "Support",
+        "SUPPORT": "Support",
+    }
+    position_values = (
+        participant.get("individualPosition"),
+        participant.get("teamPosition"),
+    )
+    for value in position_values:
+        normalized = str(value or "").strip().upper()
+        if normalized in aliases:
+            return aliases[normalized]
+
+    role = str(timeline.get("role") or participant.get("role") or "").strip().upper()
+    if role in {"DUO_SUPPORT", "SUPPORT"}:
+        return "Support"
+    if role in {"DUO_CARRY", "CARRY"}:
+        return "Bot"
+
+    lane_values = (
+        timeline.get("lane"),
+        participant.get("lane"),
+    )
+    for value in lane_values:
+        normalized = str(value or "").strip().upper()
+        if normalized in aliases:
+            return aliases[normalized]
+    return None
+
+
+def is_lane_bias_game(game):
+    if not isinstance(game, dict):
+        return False
+    game_mode = str(game.get("gameMode") or "").strip().upper()
+    if game_mode and game_mode not in {
+        "CLASSIC",
+        "SUMMONERS_RIFT",
+        "SUMMONER'S RIFT",
+        "SR",
+    }:
+        return False
+    game_type = str(game.get("gameType") or "").strip().upper()
+    if game_type and game_type not in {
+        "MATCHED_GAME",
+        "CUSTOM_GAME",
+        "TUTORIAL_GAME",
+    }:
+        return False
+    return champion_id(game.get("queueId")) in SUMMONERS_RIFT_QUEUE_IDS
 
 
 def champion_owned(champion):
@@ -670,6 +769,7 @@ def fetch_matches(session, base_url, puuid, summoner_id, max_games, champ_map):
 
     match_rows = []
     champion_counts = Counter()
+    lane_counts = Counter()
     total_kills = total_deaths = total_assists = 0
     complete_stat_matches = 0
 
@@ -700,6 +800,10 @@ def fetch_matches(session, base_url, puuid, summoner_id, max_games, champ_map):
         normalized_champ_id = champion_id(champ_id)
         if normalized_champ_id is not None and normalized_champ_id > 0:
             champion_counts[normalized_champ_id] += 1
+        match_lane = normalize_match_lane(participant)
+        lane_bias_eligible = is_lane_bias_game(game)
+        if match_lane and lane_bias_eligible:
+            lane_counts[match_lane] += 1
         if complete_stats:
             total_kills += kills
             total_deaths += deaths
@@ -719,15 +823,21 @@ def fetch_matches(session, base_url, puuid, summoner_id, max_games, champ_map):
         win = stats.get("win")
         result = "SIEG" if win is True else "NIEDERLAGE" if win is False else "UNBEKANNT"
         kda = f"{kills}/{deaths}/{assists}" if complete_stats else "–/–/–"
+        lane_part = (
+            f" | Lane {match_lane}"
+            if match_lane and lane_bias_eligible
+            else " | Lane nicht verfügbar"
+        )
         match_rows.append(
             f"{played_at} | Match {game.get('gameId', 'unbekannt')} | {mode} | "
             f"{result} | {get_champion_name(champ_map, champ_id)} | {duration_part}"
-            f"KDA {kda}"
+            f"KDA {kda}{lane_part}"
         )
 
     return (
         match_rows,
         champion_counts,
+        lane_counts,
         total_kills,
         total_deaths,
         total_assists,
@@ -1066,11 +1176,19 @@ def fetch_player_data(max_games=100):
     (
         rows,
         champion_counts,
+        lane_counts,
         total_kills,
         total_deaths,
         total_assists,
         complete_stat_matches,
     ) = fetch_matches(session, base_url, puuid, summoner_id, max_games, champ_map)
+    if lane_counts:
+        lane_bias = ";".join(
+            f"{lane}={lane_counts[lane]}"
+            for lane in LANES
+            if lane_counts[lane]
+        )
+        log(f"LANE_BIAS:{lane_bias}")
     sync_match_history_csv(session, base_url, puuid, summoner_id, champ_map, max_games=max_games)
     print(f"[INFO] Match-History-CSV gespeichert: {MATCH_HISTORY_CSV_PATH}")
 
@@ -1194,6 +1312,7 @@ def write_match_history_csv(path, records):
         "date",
         "queueId",
         "mode",
+        "lane",
         "championId",
         "championName",
         "result",
@@ -1255,6 +1374,9 @@ def sync_match_history_csv(session, base_url, puuid, summoner_id, champ_map, max
         champion_name = get_champion_name(champ_map, champion_id_value)
         queue_id = champion_id(game.get("queueId"))
         mode = QUEUE_NAMES.get(queue_id, f"Spielmodus {queue_id or 'unbekannt'}")
+        lane = normalize_match_lane(participant)
+        if not is_lane_bias_game(game):
+            lane = None
         timestamp = game.get("gameCreation")
         played_at = (
             datetime.fromtimestamp(timestamp / 1000).strftime("%Y-%m-%d %H:%M")
@@ -1267,6 +1389,7 @@ def sync_match_history_csv(session, base_url, puuid, summoner_id, champ_map, max
             "date": played_at,
             "queueId": queue_id,
             "mode": mode,
+            "lane": lane or "Not available",
             "championId": champion_id_value,
             "championName": champion_name,
             "result": "WIN" if stats.get("win") is True else "LOSS" if stats.get("win") is False else "UNKNOWN",

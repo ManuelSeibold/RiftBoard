@@ -19,11 +19,23 @@ import lol
 
 class CatalogWorker(QThread):
     loaded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, parent=None, *, require_remote=False):
+        super().__init__(parent)
+        self._require_remote = require_remote
 
     def run(self):
-        self.loaded.emit(
-            lol.get_champion_catalog(fetch_remote=True, force_refresh=True)
-        )
+        try:
+            catalog = (
+                lol.refresh_champion_catalog(prefer_data_dragon=True)
+                if self._require_remote
+                else lol.get_champion_catalog(fetch_remote=True, force_refresh=True)
+            )
+        except Exception as error:
+            self.failed.emit(str(error))
+            return
+        self.loaded.emit(catalog)
 
 
 class LaneAssignerDialog(QDialog):
@@ -44,6 +56,7 @@ class LaneAssignerDialog(QDialog):
         self._working = {}
         self._row_keys = []
         self._reset_staged = False
+        self._reset_refreshing = False
         self._allow_close = False
         self._catalog_worker = None
         self.setModal(False)
@@ -124,17 +137,68 @@ class LaneAssignerDialog(QDialog):
             return
         self._catalog_worker = CatalogWorker(self)
         self._catalog_worker.loaded.connect(self._catalog_loaded)
+        self._catalog_worker.failed.connect(self._catalog_failed)
+        self.reset_button.setEnabled(False)
         self._catalog_worker.start()
 
     def _catalog_loaded(self, catalog):
+        self.reset_button.setEnabled(True)
         if not catalog:
             self._set_catalog_message(self._tr("catalog_unavailable"))
             return
         changed = catalog != self._catalog
-        self._catalog = catalog
-        self._initialize_assignments()
+        if not self._catalog:
+            self._catalog = catalog
+            self._initialize_assignments()
+        elif changed:
+            self._merge_catalog_preserving_pending(catalog)
         if changed:
             self._on_catalog_updated(catalog)
+
+    def _catalog_failed(self, message):
+        if self._reset_refreshing:
+            self._set_reset_refreshing(False)
+            self.reset_button.setEnabled(bool(self._catalog))
+            QMessageBox.warning(
+                self,
+                self._tr("reset_title"),
+                f"{self._tr('reset_refresh_failed')}\n{message}",
+            )
+        elif not self._catalog:
+            self._set_catalog_message(self._tr("catalog_unavailable"))
+        else:
+            self.reset_button.setEnabled(True)
+
+    def _merge_catalog_preserving_pending(self, catalog):
+        old_baseline = self._baseline
+        old_working = self._working
+        reset_was_staged = self._reset_staged
+        self._catalog = catalog
+        standard, effective = lol.get_lane_assignments(self._catalog)
+        self._row_keys = []
+        self._standard = {}
+        self._baseline = {}
+        self._working = {}
+        for record in self._catalog:
+            champion_id = record.get("id")
+            key = str(champion_id) if champion_id is not None else str(record.get("name", ""))
+            if not key:
+                continue
+            numeric_id = int(champion_id) if champion_id is not None else None
+            standard_lanes = list(standard.get(numeric_id, [])) if numeric_id is not None else []
+            effective_lanes = list(effective.get(numeric_id, [])) if numeric_id is not None else []
+            self._row_keys.append(key)
+            self._standard[key] = standard_lanes
+            self._baseline[key] = list(old_baseline.get(key, effective_lanes))
+            self._working[key] = list(
+                old_working.get(
+                    key,
+                    standard_lanes if reset_was_staged else effective_lanes,
+                )
+            )
+        self._reset_staged = reset_was_staged
+        self._populate_table()
+        self._update_pending_state()
 
     def _initialize_assignments(self):
         standard, effective = lol.get_lane_assignments(self._catalog)
@@ -231,9 +295,19 @@ class LaneAssignerDialog(QDialog):
         )
 
     def _update_pending_state(self):
-        self.apply_button.setEnabled(self._has_changes() and bool(self._catalog))
+        self.apply_button.setEnabled(
+            not self._reset_refreshing and self._has_changes() and bool(self._catalog)
+        )
         suffix = f" · {self._tr('pending_changes')}" if self._has_changes() else ""
         self.setWindowTitle(self._tr("assigner_title") + suffix)
+
+    def _set_reset_refreshing(self, refreshing):
+        self._reset_refreshing = refreshing
+        self.table.setEnabled(not refreshing)
+        self.cancel_button.setEnabled(not refreshing)
+        self.close_button.setEnabled(not refreshing)
+        self.reset_button.setEnabled(not refreshing)
+        self._update_pending_state()
 
     def _discard_pending(self):
         self._working = {key: list(value) for key, value in self._baseline.items()}
@@ -332,12 +406,42 @@ class LaneAssignerDialog(QDialog):
         dialog.exec()
         if dialog.clickedButton() != yes_button:
             return
-        self._working = {
-            key: list(self._standard.get(key, [])) for key in self._row_keys
-        }
-        self._reset_staged = bool(self._saved_overrides)
+        self._set_reset_refreshing(True)
+        self._catalog_worker = CatalogWorker(self, require_remote=True)
+        self._catalog_worker.loaded.connect(self._standard_catalog_loaded)
+        self._catalog_worker.failed.connect(self._catalog_failed)
+        self._catalog_worker.start()
+
+    def _standard_catalog_loaded(self, catalog):
+        if not catalog:
+            self._catalog_failed(self._tr("catalog_unavailable"))
+            return
+        changed = catalog != self._catalog
+        self._catalog = catalog
+        standard, effective = lol.get_lane_assignments(self._catalog)
+        self._row_keys = []
+        self._standard = {}
+        self._baseline = {}
+        self._working = {}
+        for record in self._catalog:
+            champion_id = record.get("id")
+            key = str(champion_id) if champion_id is not None else str(record.get("name", ""))
+            if not key:
+                continue
+            numeric_id = int(champion_id) if champion_id is not None else None
+            standard_lanes = list(standard.get(numeric_id, [])) if numeric_id is not None else []
+            effective_lanes = list(effective.get(numeric_id, [])) if numeric_id is not None else []
+            self._row_keys.append(key)
+            self._standard[key] = standard_lanes
+            self._baseline[key] = effective_lanes
+            self._working[key] = list(standard_lanes)
+        self._reset_staged = bool(self._saved_overrides) or any(
+            self._working[key] != self._baseline[key] for key in self._row_keys
+        )
         self._populate_table()
-        self._update_pending_state()
+        self._set_reset_refreshing(False)
+        if changed:
+            self._on_catalog_updated(catalog)
 
     def prepare_to_open(self):
         if self.isVisible():
